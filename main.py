@@ -33,7 +33,7 @@ TTS_VOICE_HI = "hi-IN-SwaraNeural"
 
 SAMPLE_RATE = 16000
 CHANNELS    = 1
-MAX_TOKENS  = 80  # gpt-oss-120b burns hidden "reasoning" tokens before
+MAX_TOKENS  = 250  # gpt-oss-120b burns hidden "reasoning" tokens before
                     # writing content — too low a budget (e.g. 60) can use
                     # it all up on reasoning and return an empty answer.
                     # reasoning_effort="low" (set below) keeps that hidden
@@ -44,7 +44,7 @@ ENERGY_THRESHOLD     = 0.025
 SILENCE_AFTER_SPEECH = 0.6
 PRE_ROLL_CHUNKS      = 6
 MIN_SPEECH_SECS      = 0.3
-CHUNK_SECS           = 0.1
+CHUNK_SECS           = 0.5
 
 IDLE_TIMEOUT         = 10.0
 IDLE_POLL_TIMEOUT    = 30.0
@@ -124,6 +124,84 @@ conversation_history: list = []
 barge_in_detected = threading.Event()   # set by mic monitor thread
 
 pygame.mixer.init()
+
+
+# ──────────────────────────────────────────────
+#  TIMING  (thread-safe — STT/LLM run on the main thread
+#  while TTS + playback run on background worker threads)
+# ──────────────────────────────────────────────
+
+print_lock = threading.Lock()
+
+
+def _log(msg: str):
+    with print_lock:
+        print(msg)
+
+
+class TurnTimer:
+    """
+    Records a fixed set of named checkpoints for one conversation turn and
+    prints a clean aligned latency table once playback of the first
+    sentence starts, e.g.:
+
+        Speech End           0 ms
+        STT                  610 ms
+        GPT First Token      340 ms
+        Sentence Complete    380 ms
+        TTS Start            5 ms
+        Playback Started     260 ms
+        ------------------------------
+        Total Latency        1595 ms
+
+    Each row (after "Speech End") is the time elapsed since the PREVIOUS
+    checkpoint, not cumulative — so "Total Latency" is their sum, and
+    equals the time from "you stopped talking" to "you hear the reply".
+
+    Only the first sentence's journey is tracked (mark() ignores repeat
+    calls for a label), since that's what determines perceived latency.
+    """
+    ORDER = [
+        "Speech End",
+        "STT",
+        "GPT First Token",
+        "Sentence Complete",
+        "TTS Start",
+        "Playback Started",
+    ]
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._times: dict = {}
+
+    def mark(self, label: str):
+        with self._lock:
+            if label not in self._times:
+                self._times[label] = time.time()
+
+    def report(self):
+        rows = []
+        prev_t = None
+        total = 0.0
+        for label in self.ORDER:
+            t = self._times.get(label)
+            if t is None:
+                continue
+            delta = 0.0 if prev_t is None else (t - prev_t)
+            if prev_t is not None:
+                total += delta
+            rows.append((label, delta))
+            prev_t = t
+
+        if not rows:
+            return
+
+        width = max(len(l) for l, _ in rows + [("Total Latency", 0)]) + 4
+        lines = ["", *(f"  {label:<{width}}{delta * 1000:.0f} ms" for label, delta in rows)]
+        lines.append(f"  {'-' * (width + 8)}")
+        lines.append(f"  {'Total Latency':<{width}}{total * 1000:.0f} ms")
+        lines.append("")
+        _log("\n".join(lines))
 
 
 # ──────────────────────────────────────────────
@@ -237,7 +315,7 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
 #  TRANSCRIBE
 # ──────────────────────────────────────────────
 
-def transcribe(audio: np.ndarray) -> Tuple[str, str]:
+def transcribe(audio: np.ndarray, timer: "TurnTimer" = None) -> Tuple[str, str]:
     """Returns (text, lang_code) where lang_code is 'hi' or 'en'."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
@@ -252,6 +330,9 @@ def transcribe(audio: np.ndarray) -> Tuple[str, str]:
         )
 
     os.unlink(tmp_path)
+
+    if timer:
+        timer.mark("STT")
 
     text = (result.text or "").strip()
     lang = (result.language or "en").strip().lower()
@@ -309,7 +390,7 @@ def _extract_sentences(buffer: str):
     return sentences, buffer[start:]
 
 
-def get_ai_reply_stream(user_text: str, lang: str):
+def get_ai_reply_stream(user_text: str, lang: str, timer: "TurnTimer" = None):
     """
     Generator: yields sentences as soon as they're complete.
     Also appends the full reply to conversation_history once done.
@@ -337,6 +418,7 @@ def get_ai_reply_stream(user_text: str, lang: str):
     buffer = ""
     full_reply_parts = []
     yielded_any = False
+    first_token_seen = False
 
     try:
         stream = client.chat.completions.create(
@@ -359,6 +441,11 @@ def get_ai_reply_stream(user_text: str, lang: str):
 
             delta = chunk.choices[0].delta
             if delta.content:
+                if not first_token_seen:
+                    first_token_seen = True
+                    if timer:
+                        timer.mark("GPT First Token")
+
                 token = delta.content
                 print(token, end="", flush=True)
                 full_reply_parts.append(token)
@@ -366,11 +453,15 @@ def get_ai_reply_stream(user_text: str, lang: str):
 
                 sentences, buffer = _extract_sentences(buffer)
                 for s in sentences:
+                    if not yielded_any and timer:
+                        timer.mark("Sentence Complete")
                     yielded_any = True
                     yield s
 
         # Trailing text with no terminal punctuation still needs to be spoken
         if buffer.strip():
+            if not yielded_any and timer:
+                timer.mark("Sentence Complete")
             yielded_any = True
             yield buffer.strip()
 
@@ -384,6 +475,8 @@ def get_ai_reply_stream(user_text: str, lang: str):
             else "I'm experiencing a network issue. Please try again in a moment."
         )
         full_reply_parts = [fallback]
+        if not yielded_any and timer:
+            timer.mark("Sentence Complete")
         yielded_any = True
         yield fallback
 
@@ -395,6 +488,8 @@ def get_ai_reply_stream(user_text: str, lang: str):
             else "Sorry, I didn't get that. Could you please ask again?"
         )
         full_reply_parts = [fallback]
+        if timer:
+            timer.mark("Sentence Complete")
         yield fallback
 
     reply = "".join(full_reply_parts).strip()
@@ -436,17 +531,23 @@ async def _tts(text: str, path: str, voice: str):
     await edge_tts.Communicate(text, voice=voice).save(path)
 
 
-def _tts_worker(sentence_q: "queue.Queue", audio_q: "queue.Queue", lang: str):
+def _tts_worker(sentence_q: "queue.Queue", audio_q: "queue.Queue", lang: str, timer: "TurnTimer" = None):
     """
     Pulls finished sentences off sentence_q, synthesizes each to a temp
     mp3, and pushes the file path onto audio_q — as soon as it's ready,
     not after the whole reply is done.
     """
+    first = True
     while True:
         item = sentence_q.get()
         if item is SENTINEL:
             audio_q.put(SENTINEL)
             return
+
+        if first:
+            first = False
+            if timer:
+                timer.mark("TTS Start")
 
         voice = pick_voice(item, lang)
         try:
@@ -455,18 +556,25 @@ def _tts_worker(sentence_q: "queue.Queue", audio_q: "queue.Queue", lang: str):
             asyncio.run(_tts(item, tmp_path, voice))
             audio_q.put(tmp_path)
         except Exception as e:
-            print(f"\n   ⚠️  TTS error: {e}")
+            _log(f"\n   ⚠️  TTS error: {e}")
 
 
-def _player_worker(audio_q: "queue.Queue"):
+def _player_worker(audio_q: "queue.Queue", timer: "TurnTimer" = None):
     """
     Plays synthesized mp3s in order, as soon as each becomes available.
     Never waits for later sentences to be ready before starting.
     """
+    first = True
     while True:
         item = audio_q.get()
         if item is SENTINEL:
             return
+
+        if first:
+            first = False
+            if timer:
+                timer.mark("Playback Started")
+                timer.report()
 
         try:
             pygame.mixer.music.load(item)
@@ -475,7 +583,7 @@ def _player_worker(audio_q: "queue.Queue"):
                 pygame.time.wait(30)
             pygame.mixer.music.unload()
         except Exception as e:
-            print(f"\n   ⚠️  Playback error: {e}")
+            _log(f"\n   ⚠️  Playback error: {e}")
         finally:
             try:
                 os.unlink(item)
@@ -483,25 +591,27 @@ def _player_worker(audio_q: "queue.Queue"):
                 pass
 
 
-def speak_reply_streaming(user_text: str, lang: str) -> str:
+def speak_reply_streaming(user_text: str, lang: str, timer: "TurnTimer" = None) -> str:
     """
     Full low-latency pipeline: streams the LLM reply sentence-by-sentence,
     synthesizes each sentence to speech as soon as it's complete, and plays
     sentences back in order — all three stages running concurrently, so
     playback starts on sentence 1 while sentence 2+ is still being
     generated/synthesized. No "wait for full answer" / "wait for full mp3".
+
+    timer: TurnTimer used to record + print the latency table. Optional.
     """
     sentence_q: "queue.Queue" = queue.Queue()
     audio_q:    "queue.Queue" = queue.Queue()
 
-    tts_thread    = threading.Thread(target=_tts_worker, args=(sentence_q, audio_q, lang), daemon=True)
-    player_thread = threading.Thread(target=_player_worker, args=(audio_q,), daemon=True)
+    tts_thread    = threading.Thread(target=_tts_worker, args=(sentence_q, audio_q, lang, timer), daemon=True)
+    player_thread = threading.Thread(target=_player_worker, args=(audio_q, timer), daemon=True)
     tts_thread.start()
     player_thread.start()
 
     full_reply = ""
     try:
-        for sentence in get_ai_reply_stream(user_text, lang):
+        for sentence in get_ai_reply_stream(user_text, lang, timer=timer):
             full_reply += (" " if full_reply else "") + sentence
             sentence_q.put(sentence)
     finally:
@@ -640,7 +750,9 @@ Hello , i am robobot , how can i help you.
                     continue
 
                 print("🔍 Transcribing...")
-                user_text, lang = transcribe(audio)
+                turn_timer = TurnTimer()
+                turn_timer.mark("Speech End")
+                user_text, lang = transcribe(audio, timer=turn_timer)
 
                 if not user_text:
                     print("⚠️  Could not understand — listening again.")
@@ -660,7 +772,7 @@ Hello , i am robobot , how can i help you.
                 # Generates + synthesizes + plays sentence-by-sentence.
                 # Speech starts on the first sentence — no waiting for the
                 # full answer or the full mp3.
-                reply = speak_reply_streaming(user_text, lang)
+                reply = speak_reply_streaming(user_text, lang, timer=turn_timer)
                 print(f"   AI [{lang.upper()}] › {reply}")
 
                 state = State.LISTENING
